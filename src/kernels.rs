@@ -14,94 +14,210 @@ fn gelu_f(x: f32) -> f32 {
 }
 "#;
 
-pub const MATMUL: &str = r#"
-// C[batch][m][n] (+)= alpha * sum_k A[batch][m][k] * B[batch][k][n]   (B read transposed if b_trans)
-// P: m n k flags | a_off a_ld a_bs b_off | b_ld b_bs b_trans c_off | c_ld c_bs alpha(bits) act
-// flags: 1 = bias, 2 = accumulate into C ; act: 1 = gelu
-// 64x64 output tile per workgroup of 16x16 threads; thread (tx, ty) owns rows ty+16i, cols tx+16j.
+/// Shape of the matmul kernel. A workgroup of tx*ty threads computes a
+/// (ty*ry) x (tx*rx) output tile; every thread keeps an ry x rx block of
+/// accumulators in registers. With `shared` the operands are staged through
+/// workgroup memory `ks` columns of K at a time; without it every thread reads
+/// its rows of A and columns of B straight from the buffers.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct MmCfg {
+    pub kind: char, // 's' shared scalar, 'v' shared vec4, 'd' direct
+    pub tx: u32,
+    pub ty: u32,
+    pub rx: u32, // multiple of 4
+    pub ry: u32,
+    pub ks: u32,
+    pub fma: bool,
+}
+
+impl MmCfg {
+    pub const DEFAULT: MmCfg = MmCfg { kind: 's', tx: 16, ty: 16, rx: 4, ry: 4, ks: 16, fma: false };
+    /// Kernel variants for a GPU vendor (PCI id); the dispatcher picks per matrix shape.
+    pub fn defaults(_vendor: u32) -> Vec<MmCfg> {
+        let s = |tx, ty| MmCfg { kind: 's', tx, ty, rx: 8, ry: 8, ks: 16, fma: false };
+        // 128x128 tiles for the big products, narrower ones for N = 64 and the 46x46 band attention.
+        vec![s(16, 16), s(8, 16), s(8, 8)]
+    }
+    pub fn tile_m(&self) -> u32 {
+        self.ty * self.ry
+    }
+    pub fn tile_n(&self) -> u32 {
+        self.tx * self.rx
+    }
+    /// "s|d,tx,ty,rx,ry,ks[,fma]"
+    pub fn parse(s: &str) -> Option<MmCfg> {
+        let p: Vec<&str> = s.split(',').collect();
+        if p.len() < 6 {
+            return None;
+        }
+        let n = |i: usize| p[i].trim().parse::<u32>().ok();
+        let c = MmCfg { kind: p[0].trim().chars().next()?, tx: n(1)?, ty: n(2)?, rx: n(3)?, ry: n(4)?, ks: n(5)?, fma: p.len() > 6 && p[6].trim() == "fma" };
+        let ok = c.tx > 0 && c.ty > 0 && c.ry > 0 && c.ks > 0 && c.rx >= 4 && c.rx % 4 == 0 && c.tx * c.ty <= 256
+            && "svd".contains(c.kind) && (c.kind != 'v' || c.ry % 4 == 0) && (c.kind == 'd' || c.ks * (c.tile_m() + c.tile_n() + 2) * 4 <= 32768);
+        ok.then_some(c)
+    }
+}
+
+/// C[batch][m][n] (+)= sum_k A[batch][m][k] * B[batch][k][n]   (B read transposed if b_trans)
+/// P: m n k flags | a_off a_ld a_bs b_off | b_ld b_bs b_trans c_off | c_ld c_bs - act
+/// flags: 1 = bias, 2 = accumulate into C, 4 = scale row m of batch z by bias[z * M + m] ; act: 1 = gelu
+pub fn matmul(c: MmCfg) -> String {
+    use std::fmt::Write;
+    let (tx, ty, rx, ry, ks) = (c.tx, c.ty, c.rx, c.ry, c.ks);
+    let (tm, tn, nt) = (c.tile_m(), c.tile_n(), tx * ty);
+    let (lda, ldb) = (tm + 1, tn + 1);
+    let nv = rx / 4;
+    let mut s = String::new();
+    s.push_str(
+        r#"
 @group(0) @binding(0) var<storage, read> A: array<f32>;
 @group(0) @binding(1) var<storage, read> B: array<f32>;
 @group(0) @binding(2) var<storage, read_write> C: array<f32>;
 @group(0) @binding(3) var<storage, read> bias: array<f32>;
 @group(0) @binding(7) var<storage, read> P: array<u32>;
-
-const LDS: u32 = 65u;
-var<workgroup> As: array<f32, 1040>; // [k][m], 16 x 65
-var<workgroup> Bs: array<f32, 1040>; // [k][n], 16 x 65
-
-@compute @workgroup_size(16, 16)
-fn main(@builtin(local_invocation_id) lid: vec3<u32>, @builtin(workgroup_id) wid: vec3<u32>) {
+"#,
+    );
+    if c.kind == 's' {
+        let _ = writeln!(s, "var<workgroup> As: array<f32, {}>;\nvar<workgroup> Bs: array<f32, {}>;", ks * lda, ks * ldb);
+    } else if c.kind == 'v' {
+        let _ = writeln!(s, "var<workgroup> As: array<vec4<f32>, {}>;\nvar<workgroup> Bs: array<vec4<f32>, {}>;", ks * tm / 4, ks * tn / 4);
+    }
+    let _ = writeln!(s, "@compute @workgroup_size({tx}, {ty})");
+    s.push_str(
+        r#"fn main(@builtin(local_invocation_id) lid: vec3<u32>, @builtin(workgroup_id) wid: vec3<u32>) {
     let M = P[0]; let N = P[1]; let K = P[2]; let flags = P[3];
     let a_off = P[4]; let a_ld = P[5]; let a_bs = P[6]; let b_off = P[7];
     let b_ld = P[8]; let b_bs = P[9]; let b_trans = P[10]; let c_off = P[11];
-    let c_ld = P[12]; let c_bs = P[13]; let alpha = bitcast<f32>(P[14]); let act = P[15];
+    let c_ld = P[12]; let c_bs = P[13]; let act = P[15];
     let tx = lid.x; let ty = lid.y;
-    let tid = ty * 16u + tx;
-    let row0 = wid.y * 64u; let col0 = wid.x * 64u;
     let batch = wid.z;
     let a_base = a_off + batch * a_bs;
     let b_base = b_off + batch * b_bs;
-    var acc0 = vec4<f32>(0.0);
-    var acc1 = vec4<f32>(0.0);
-    var acc2 = vec4<f32>(0.0);
-    var acc3 = vec4<f32>(0.0);
-    for (var k0 = 0u; k0 < K; k0 += 16u) {
-        // A tile: element e -> (m = e/16, kk = e%16); stored [kk][m]
-        for (var i = 0u; i < 4u; i++) {
-            let e = tid + i * 256u;
-            let m = e / 16u; let kk = e % 16u;
-            let gm = row0 + m; let gk = k0 + kk;
-            var av = 0.0;
-            if (gm < M && gk < K) { av = A[a_base + gm * a_ld + gk]; }
-            As[kk * LDS + m] = av;
-        }
-        if (b_trans == 1u) {
-            for (var i = 0u; i < 4u; i++) {
-                let e = tid + i * 256u;
-                let n = e / 16u; let kb = e % 16u;
-                let gn = col0 + n; let gk = k0 + kb;
-                var bv = 0.0;
-                if (gn < N && gk < K) { bv = B[b_base + gn * b_ld + gk]; }
-                Bs[kb * LDS + n] = bv;
-            }
-        } else {
-            for (var i = 0u; i < 4u; i++) {
-                let e = tid + i * 256u;
-                let kb = e / 64u; let n = e % 64u;
-                let gn = col0 + n; let gk = k0 + kb;
-                var bv = 0.0;
-                if (gn < N && gk < K) { bv = B[b_base + gk * b_ld + gn]; }
-                Bs[kb * LDS + n] = bv;
-            }
-        }
-        workgroupBarrier();
-        for (var kk = 0u; kk < 16u; kk++) {
-            let o = kk * LDS;
-            let bv = vec4<f32>(Bs[o + tx], Bs[o + tx + 16u], Bs[o + tx + 32u], Bs[o + tx + 48u]);
-            let a0 = As[o + ty]; let a1 = As[o + ty + 16u];
-            let a2 = As[o + ty + 32u]; let a3 = As[o + ty + 48u];
-            acc0 += a0 * bv; acc1 += a1 * bv; acc2 += a2 * bv; acc3 += a3 * bv;
-        }
-        workgroupBarrier();
-    }
-    var accs = array<vec4<f32>, 4>(acc0, acc1, acc2, acc3);
-    for (var i = 0u; i < 4u; i++) {
-        let gm = row0 + ty + 16u * i;
-        if (gm >= M) { continue; }
-        for (var j = 0u; j < 4u; j++) {
-            let gn = col0 + tx + 16u * j;
-            if (gn < N) {
-                var v = accs[i][j] * alpha;
-                if ((flags & 1u) != 0u) { v += bias[gn]; }
-                if (act == 1u) { v = gelu_f(v); }
-                let idx = c_off + batch * c_bs + gm * c_ld + gn;
-                if ((flags & 2u) != 0u) { v += C[idx]; }
-                C[idx] = v;
-            }
+"#,
+    );
+    let _ = writeln!(s, "    let tid = ty * {tx}u + tx;\n    let row0 = wid.y * {tm}u; let col0 = wid.x * {tn}u;");
+    for i in 0..ry {
+        for j in 0..nv {
+            let _ = writeln!(s, "    var acc_{i}_{j} = vec4<f32>(0.0);");
         }
     }
+    let upd = |s: &mut String, ind: &str| {
+        for i in 0..ry {
+            for j in 0..nv {
+                if c.fma {
+                    let _ = writeln!(s, "{ind}acc_{i}_{j} = fma(vec4<f32>(a{i}), b{j}, acc_{i}_{j});");
+                } else {
+                    let _ = writeln!(s, "{ind}acc_{i}_{j} += a{i} * b{j};");
+                }
+            }
+        }
+    };
+    if c.kind == 'v' {
+        // Workgroup memory holds vec4s: slot (kk, m4) of As is A[row0 + 4*m4 .. +4][k0 + kk], and
+        // likewise for Bs, so a thread fetches its 8 operands of a k step with 4 loads.
+        let (ea, eb) = (tm / 4 * ks, tn / 4 * ks);
+        let (la, lb) = (ea.div_ceil(nt), eb.div_ceil(nt));
+        let (qa, qb) = (tm / 4, tn / 4);
+        let ga = if ea % nt != 0 { format!("            if (e >= {ea}u) {{ break; }}\n") } else { String::new() };
+        let gb = if eb % nt != 0 { format!("                if (e >= {eb}u) {{ break; }}\n") } else { String::new() };
+        let _ = writeln!(s, "    let rmax = M - 1u; let cmax = N - 1u;\n    for (var k0 = 0u; k0 < K; k0 += {ks}u) {{");
+        let _ = writeln!(
+            s,
+            "        for (var i = 0u; i < {la}u; i++) {{\n            let e = tid + i * {nt}u;\n{ga}            let m4 = e / {ks}u; let kk = e % {ks}u;\n            let gm = row0 + m4 * 4u; let gk = k0 + kk;\n            var av = vec4<f32>(0.0);\n            if (gk < K) {{\n                av = vec4<f32>(A[a_base + min(gm, rmax) * a_ld + gk], A[a_base + min(gm + 1u, rmax) * a_ld + gk], A[a_base + min(gm + 2u, rmax) * a_ld + gk], A[a_base + min(gm + 3u, rmax) * a_ld + gk]);\n            }}\n            As[kk * {qa}u + m4] = av;\n        }}"
+        );
+        let _ = writeln!(
+            s,
+            "        if (b_trans == 1u) {{\n            for (var i = 0u; i < {lb}u; i++) {{\n                let e = tid + i * {nt}u;\n{gb}                let n4 = e / {ks}u; let kb = e % {ks}u;\n                let gn = col0 + n4 * 4u; let gk = k0 + kb;\n                var bv = vec4<f32>(0.0);\n                if (gk < K) {{\n                    bv = vec4<f32>(B[b_base + min(gn, cmax) * b_ld + gk], B[b_base + min(gn + 1u, cmax) * b_ld + gk], B[b_base + min(gn + 2u, cmax) * b_ld + gk], B[b_base + min(gn + 3u, cmax) * b_ld + gk]);\n                }}\n                Bs[kb * {qb}u + n4] = bv;\n            }}\n        }} else {{\n            for (var i = 0u; i < {lb}u; i++) {{\n                let e = tid + i * {nt}u;\n{gb}                let kb = e / {qb}u; let n4 = e % {qb}u;\n                let gn = col0 + n4 * 4u; let gk = k0 + kb;\n                var bv = vec4<f32>(0.0);\n                if (gk < K) {{\n                    let o = b_base + gk * b_ld;\n                    bv = vec4<f32>(B[o + min(gn, cmax)], B[o + min(gn + 1u, cmax)], B[o + min(gn + 2u, cmax)], B[o + min(gn + 3u, cmax)]);\n                }}\n                Bs[kb * {qb}u + n4] = bv;\n            }}\n        }}\n        workgroupBarrier();"
+        );
+        let _ = writeln!(s, "        for (var kk = 0u; kk < {ks}u; kk++) {{\n            let oa = kk * {qa}u + ty * {}u; let ob = kk * {qb}u + tx * {}u;", ry / 4, nv);
+        for j in 0..nv {
+            let _ = writeln!(s, "            let b{j} = Bs[ob + {j}u];");
+        }
+        for i in 0..ry / 4 {
+            let _ = writeln!(s, "            let av{i} = As[oa + {i}u];");
+        }
+        for i in 0..ry {
+            let _ = writeln!(s, "            let a{i} = av{}[{}];", i / 4, i % 4);
+        }
+        upd(&mut s, "            ");
+        s.push_str("        }\n        workgroupBarrier();\n    }\n");
+    } else if c.kind == 's' {
+        let (ea, eb) = (tm * ks, tn * ks);
+        let (la, lb) = (ea.div_ceil(nt), eb.div_ceil(nt));
+        let _ = writeln!(s, "    for (var k0 = 0u; k0 < K; k0 += {ks}u) {{");
+        let _ = writeln!(s, "        for (var i = 0u; i < {la}u; i++) {{\n            let e = tid + i * {nt}u;");
+        if ea % nt != 0 {
+            let _ = writeln!(s, "            if (e >= {ea}u) {{ break; }}");
+        }
+        let _ = writeln!(
+            s,
+            "            let m = e / {ks}u; let kk = e % {ks}u;\n            let gm = row0 + m; let gk = k0 + kk;\n            var av = 0.0;\n            if (gm < M && gk < K) {{ av = A[a_base + gm * a_ld + gk]; }}\n            As[kk * {lda}u + m] = av;\n        }}"
+        );
+        let guard = if eb % nt != 0 { format!("                if (e >= {eb}u) {{ break; }}\n") } else { String::new() };
+        let _ = writeln!(
+            s,
+            "        if (b_trans == 1u) {{\n            for (var i = 0u; i < {lb}u; i++) {{\n                let e = tid + i * {nt}u;\n{guard}                let n = e / {ks}u; let kb = e % {ks}u;\n                let gn = col0 + n; let gk = k0 + kb;\n                var bv = 0.0;\n                if (gn < N && gk < K) {{ bv = B[b_base + gn * b_ld + gk]; }}\n                Bs[kb * {ldb}u + n] = bv;\n            }}\n        }} else {{\n            for (var i = 0u; i < {lb}u; i++) {{\n                let e = tid + i * {nt}u;\n{guard}                let kb = e / {tn}u; let n = e % {tn}u;\n                let gn = col0 + n; let gk = k0 + kb;\n                var bv = 0.0;\n                if (gn < N && gk < K) {{ bv = B[b_base + gk * b_ld + gn]; }}\n                Bs[kb * {ldb}u + n] = bv;\n            }}\n        }}\n        workgroupBarrier();"
+        );
+        let _ = writeln!(s, "        for (var kk = 0u; kk < {ks}u; kk++) {{\n            let oa = kk * {lda}u + ty; let ob = kk * {ldb}u + tx;");
+        for j in 0..nv {
+            let e: Vec<String> = (0..4).map(|q| format!("Bs[ob + {}u]", (j * 4 + q) * tx)).collect();
+            let _ = writeln!(s, "            let b{j} = vec4<f32>({});", e.join(", "));
+        }
+        for i in 0..ry {
+            let _ = writeln!(s, "            let a{i} = As[oa + {}u];", i * ty);
+        }
+        upd(&mut s, "            ");
+        s.push_str("        }\n        workgroupBarrier();\n    }\n");
+    } else {
+        // Rows/columns past the edge are clamped: they compute values that are never stored.
+        for i in 0..ry {
+            let _ = writeln!(s, "    let ra{i} = a_base + min(row0 + ty * {ry}u + {i}u, M - 1u) * a_ld;");
+        }
+        s.push_str("    if (b_trans == 1u) {\n");
+        for j in 0..rx {
+            let _ = writeln!(s, "        let cb{j} = b_base + min(col0 + tx * {rx}u + {j}u, N - 1u) * b_ld;");
+        }
+        s.push_str("        for (var k = 0u; k < K; k++) {\n");
+        for j in 0..nv {
+            let e: Vec<String> = (0..4).map(|q| format!("B[cb{} + k]", j * 4 + q)).collect();
+            let _ = writeln!(s, "            let b{j} = vec4<f32>({});", e.join(", "));
+        }
+        for i in 0..ry {
+            let _ = writeln!(s, "            let a{i} = A[ra{i} + k];");
+        }
+        upd(&mut s, "            ");
+        s.push_str("        }\n    } else {\n");
+        for j in 0..rx {
+            let _ = writeln!(s, "        let cb{j} = b_base + min(col0 + tx * {rx}u + {j}u, N - 1u);");
+        }
+        s.push_str("        for (var k = 0u; k < K; k++) {\n            let kb = k * b_ld;\n");
+        for j in 0..nv {
+            let e: Vec<String> = (0..4).map(|q| format!("B[cb{} + kb]", j * 4 + q)).collect();
+            let _ = writeln!(s, "            let b{j} = vec4<f32>({});", e.join(", "));
+        }
+        for i in 0..ry {
+            let _ = writeln!(s, "            let a{i} = A[ra{i} + k];");
+        }
+        upd(&mut s, "            ");
+        s.push_str("        }\n    }\n");
+    }
+    for i in 0..ry {
+        let gm = if c.kind == 's' { format!("row0 + ty + {}u", i * ty) } else { format!("row0 + ty * {ry}u + {i}u") };
+        let _ = writeln!(s, "    {{\n        let gm = {gm};\n        if (gm < M) {{");
+        for j in 0..rx {
+            let gn = if c.kind == 's' { format!("col0 + tx + {}u", j * tx) } else { format!("col0 + tx * {rx}u + {j}u") };
+            let _ = writeln!(
+                s,
+                "            {{\n                let gn = {gn};\n                if (gn < N) {{\n                    var v = acc_{i}_{}[{}];\n                    if ((flags & 4u) != 0u) {{ v *= bias[batch * M + gm]; }}\n                    if ((flags & 1u) != 0u) {{ v += bias[gn]; }}\n                    if (act == 1u) {{ v = gelu_f(v); }}\n                    let idx = c_off + batch * c_bs + gm * c_ld + gn;\n                    if ((flags & 2u) != 0u) {{ v += C[idx]; }}\n                    C[idx] = v;\n                }}\n            }}",
+                j / 4,
+                j % 4
+            );
+        }
+        s.push_str("        }\n    }\n");
+    }
+    s.push_str("}\n");
+    s
 }
-"#;
 
 pub const LAYERNORM: &str = r#"
 // P: rows cols in_off in_ld | out_off out_ld flags(1=pre affine) eps(bits)
@@ -151,8 +267,10 @@ fn main(@builtin(local_invocation_id) lid: vec3<u32>, @builtin(workgroup_id) wid
 "#;
 
 pub const SOFTMAX: &str = r#"
-// in place over rows. P: rows cols
+// data <- exp(data - rowmax) in place, inv[row] <- 1 / rowsum; the division is applied by the
+// matmul that consumes the scores (flag 4). P: rows cols
 @group(0) @binding(0) var<storage, read_write> data: array<f32>;
+@group(0) @binding(1) var<storage, read_write> inv: array<f32>;
 @group(0) @binding(7) var<storage, read> P: array<u32>;
 var<workgroup> red: array<f32, 256>;
 
@@ -184,8 +302,7 @@ fn main(@builtin(local_invocation_id) lid: vec3<u32>, @builtin(workgroup_id) wid
         if (lid.x < st) { red[lid.x] += red[lid.x + st]; }
         workgroupBarrier();
     }
-    let inv = 1.0 / red[0];
-    for (var c = lid.x; c < cols; c += 256u) { data[base + c] = data[base + c] * inv; }
+    if (lid.x == 0u) { inv[row] = 1.0 / red[0]; }
 }
 "#;
 

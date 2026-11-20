@@ -55,15 +55,14 @@ struct MambaW {
     dt_proj: Lin,
     a: Buffer, // -exp(A_log) [inner, 16]
     d: Buffer,
-    out_proj: Lin,
+    out: Buffer, // output_proj half @ out_proj, [W, inner]
 }
 
 struct BiW {
     fwd: MambaW,
     bwd: MambaW,
-    out_w: Buffer,    // [W, 2W]
     out_b: Buffer,
-    sum_w: Buffer,    // W1 + W2, [W, W]
+    sum_w: Buffer, // W1 + W2, [W, W]
     norm: Ln,
 }
 
@@ -82,7 +81,8 @@ struct Prof {
     qs: wgpu::QuerySet,
     cap: u32,
     next: std::cell::Cell<u32>,
-    names: std::cell::RefCell<Vec<&'static str>>,
+    names: std::cell::RefCell<Vec<(String, f64)>>, // (label, flops)
+    tag: std::cell::RefCell<Option<(String, f64)>>,
 }
 
 pub struct GpuModel {
@@ -92,6 +92,7 @@ pub struct GpuModel {
     device: wgpu::Device,
     queue: wgpu::Queue,
     pipes: HashMap<&'static str, wgpu::ComputePipeline>,
+    mm_cfgs: Vec<(k::MmCfg, wgpu::ComputePipeline)>,
     dummy: Buffer,
     edges: Vec<(usize, usize)>,
     encs: Vec<Enc>,
@@ -124,6 +125,7 @@ struct Scratch {
     v: Buffer,
     o: Buffer,
     scores: Buffer,
+    inv: Buffer, // 1 / row sum of the scores of the current attention group
     score_group: usize,
     u: Buffer,
     pre: Buffer,
@@ -185,9 +187,16 @@ impl GpuModel {
             bail!("this GPU's buffer limits are too small for the model (need ~{} MB per buffer)", need >> 20);
         }
 
+        let mm_list: Vec<k::MmCfg> = match std::env::var("INWORLD_MM") {
+            Ok(s) => s.split(';').map(|c| k::MmCfg::parse(c).with_context(|| format!("bad INWORLD_MM '{c}'"))).collect::<Result<_>>()?,
+            Err(_) => k::MmCfg::defaults(info.vendor),
+        };
+        let checked = std::env::var_os("INWORLD_CHECKED").is_some();
         let mut pipes = HashMap::new();
+        let mut mm_cfgs = Vec::new();
+        let mm_srcs: Vec<String> = mm_list.iter().map(|c| k::matmul(*c)).collect();
+        let mut sources: Vec<(&'static str, &str, Option<k::MmCfg>)> = mm_srcs.iter().zip(&mm_list).map(|(s, c)| ("matmul", s.as_str(), Some(*c))).collect();
         for (name, src) in [
-            ("matmul", k::MATMUL),
             ("layernorm", k::LAYERNORM),
             ("softmax", k::SOFTMAX),
             ("qkv_split", k::QKV_SPLIT),
@@ -196,10 +205,20 @@ impl GpuModel {
             ("conv_silu", k::CONV_SILU),
             ("scan", k::SCAN),
         ] {
-            let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            sources.push((name, src, None));
+        }
+        for (name, src, mm) in sources {
+            let desc = wgpu::ShaderModuleDescriptor {
                 label: Some(name),
                 source: wgpu::ShaderSource::Wgsl(std::borrow::Cow::Owned(format!("{}{}", k::PRELUDE, src))),
-            });
+            };
+            // SAFETY: the kernels are our own and every index they form is derived from the
+            // dispatch parameters computed in this file, so naga's per-access clamps are redundant.
+            let module = if checked {
+                device.create_shader_module(desc)
+            } else {
+                unsafe { device.create_shader_module_trusted(desc, wgpu::ShaderRuntimeChecks::unchecked()) }
+            };
             let pipe = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
                 label: Some(name),
                 layout: None,
@@ -208,7 +227,12 @@ impl GpuModel {
                 compilation_options: Default::default(),
                 cache: None,
             });
-            pipes.insert(name, pipe);
+            match mm {
+                Some(c) => mm_cfgs.push((c, pipe)),
+                None => {
+                    pipes.insert(name, pipe);
+                }
+            }
         }
 
         let raw = read_safetensors(path)?;
@@ -232,7 +256,11 @@ impl GpuModel {
                 inp: w.shape[1],
             })
         };
-        let mamba = |p: &str| -> Result<MambaW> {
+        // `half` selects the columns of the BiMamba output projection that this direction feeds.
+        let mamba = |p: &str, outer: &RawTensor, half: usize| -> Result<MambaW> {
+            let wd = cfg.width;
+            let op = get(&format!("{p}.out_proj.weight"))?; // [W, inner]
+            let out = crate::config::compose(&outer.data, wd, 2 * wd, half * wd, wd, &op.data, op.shape[1]);
             let a: Vec<f32> = get(&format!("{p}.A_log"))?.data.iter().map(|v| -v.exp()).collect();
             Ok(MambaW {
                 in_proj: lin(&format!("{p}.in_proj"), false)?,
@@ -242,7 +270,7 @@ impl GpuModel {
                 dt_proj: lin(&format!("{p}.dt_proj"), true)?,
                 a: up(&a),
                 d: up(&get(&format!("{p}.D"))?.data),
-                out_proj: lin(&format!("{p}.out_proj"), false)?,
+                out: up(&out),
             })
         };
         let bimamba = |p: &str| -> Result<BiW> {
@@ -255,9 +283,8 @@ impl GpuModel {
                 }
             }
             Ok(BiW {
-                fwd: mamba(&format!("{p}.forward_blocks"))?,
-                bwd: mamba(&format!("{p}.backward_blocks"))?,
-                out_w: up(&w.data),
+                fwd: mamba(&format!("{p}.forward_blocks"), w, 0)?,
+                bwd: mamba(&format!("{p}.backward_blocks"), w, 1)?,
                 out_b: up(&get(&format!("{p}.output_proj.bias"))?.data),
                 sum_w: up(&sum),
                 norm: ln(&format!("{p}.norm"))?,
@@ -330,11 +357,12 @@ impl GpuModel {
                 cap,
                 next: std::cell::Cell::new(0),
                 names: std::cell::RefCell::new(Vec::new()),
+                tag: std::cell::RefCell::new(None),
             })
         } else {
             None
         };
-        Ok((Self { scratch_cache: std::cell::RefCell::new(None), prof, cfg, device, queue, pipes, dummy, edges, encs, blocks, cond_scale, cond_shift, heads, stft }, name))
+        Ok((Self { scratch_cache: std::cell::RefCell::new(None), prof, cfg, device, queue, pipes, mm_cfgs, dummy, edges, encs, blocks, cond_scale, cond_shift, heads, stft }, name))
     }
 
     fn storage(&self, floats: usize) -> Buffer {
@@ -382,6 +410,7 @@ impl GpuModel {
             v: self.storage(r * w),
             o: self.storage(r * w),
             scores: self.storage(scores_len),
+            inv: self.storage((score_group * h * frames).max(frames * h * b)),
             score_group,
             u: self.storage(r * inner),
             pre: self.storage(r * inner),
@@ -395,7 +424,12 @@ impl GpuModel {
     }
 
     fn dispatch(&self, pass: &mut ComputePass<'_>, name: &'static str, bufs: &[&Buffer], params: &[u32], groups: [u32; 3]) {
-        let pipe = &self.pipes[name];
+        self.dispatch_pipe(pass, &self.pipes[name], name, bufs, params, groups)
+    }
+
+    fn dispatch_pipe(
+        &self, pass: &mut ComputePass<'_>, pipe: &wgpu::ComputePipeline, name: &'static str, bufs: &[&Buffer], params: &[u32], groups: [u32; 3],
+    ) {
         let pbuf = self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: None,
             contents: bytemuck::cast_slice(params),
@@ -422,7 +456,7 @@ impl GpuModel {
         if let Some((p, i)) = slot {
             pass.write_timestamp(&p.qs, i + 1);
             p.next.set(i + 2);
-            p.names.borrow_mut().push(name);
+            p.names.borrow_mut().push(p.tag.borrow_mut().take().unwrap_or((name.to_string(), 0.0)));
         }
     }
 
@@ -432,13 +466,38 @@ impl GpuModel {
         a_off: usize, a_ld: usize, a_bs: usize, b_off: usize, b_ld: usize, b_bs: usize, b_trans: bool, c_off: usize, c_ld: usize,
         c_bs: usize, batch: usize, accum: bool, gelu: bool,
     ) {
-        let flags = bias.is_some() as u32 | ((accum as u32) << 1);
+        self.mm_ex(pass, a, b, c, bias, None, m, n, kdim, a_off, a_ld, a_bs, b_off, b_ld, b_bs, b_trans, c_off, c_ld, c_bs, batch, accum, gelu)
+    }
+
+    /// `mm` with an optional per-row scale (rows of every batch) instead of a bias.
+    #[allow(clippy::too_many_arguments)]
+    fn mm_ex(
+        &self, pass: &mut ComputePass<'_>, a: &Buffer, b: &Buffer, c: &Buffer, bias: Option<&Buffer>, row_scale: Option<&Buffer>, m: usize,
+        n: usize, kdim: usize, a_off: usize, a_ld: usize, a_bs: usize, b_off: usize, b_ld: usize, b_bs: usize, b_trans: bool, c_off: usize,
+        c_ld: usize, c_bs: usize, batch: usize, accum: bool, gelu: bool,
+    ) {
+        debug_assert!(bias.is_none() || row_scale.is_none());
+        let flags = bias.is_some() as u32 | ((accum as u32) << 1) | ((row_scale.is_some() as u32) << 2);
+        let bias = bias.or(row_scale);
         let p = [
             m as u32, n as u32, kdim as u32, flags, a_off as u32, a_ld as u32, a_bs as u32, b_off as u32, b_ld as u32, b_bs as u32,
             b_trans as u32, c_off as u32, c_ld as u32, c_bs as u32, 1.0f32.to_bits(), gelu as u32,
         ];
         let bias = bias.unwrap_or(&self.dummy);
-        self.dispatch(pass, "matmul", &[a, b, c, bias], &p, [n.div_ceil(64) as u32, m.div_ceil(64) as u32, batch as u32]);
+        // The kernel variant whose tile wastes the least work on this shape (first wins ties).
+        let padded = |c: &k::MmCfg| (n as u64).div_ceil(c.tile_n() as u64) * c.tile_n() as u64 * ((m as u64).div_ceil(c.tile_m() as u64) * c.tile_m() as u64);
+        // The first variant is the fastest per flop: leave it only for a clear saving.
+        let mut best = &self.mm_cfgs[0];
+        for cand in &self.mm_cfgs[1..] {
+            if padded(&cand.0) * 10 < padded(&best.0) * 9 {
+                best = cand;
+            }
+        }
+        let (cfg, pipe) = best;
+        if let Some(pr) = &self.prof {
+            *pr.tag.borrow_mut() = Some((format!("matmul {m}x{n} k={kdim} x{batch}"), 2.0 * (m * n * kdim * batch) as f64));
+        }
+        self.dispatch_pipe(pass, pipe, "matmul", &[a, b, c, bias], &p, [(n as u32).div_ceil(cfg.tile_n()), (m as u32).div_ceil(cfg.tile_m()), batch as u32]);
     }
 
     /// out[rows, lin.out] (+)= x[rows, lin.inp] @ W^T (+ bias)
@@ -481,15 +540,20 @@ impl GpuModel {
             let batch = n * h;
             let off = g0 * h * t * hd;
             self.mm(pass, &s.q, &s.kk, &s.scores, None, t, t, hd, off, hd, t * hd, off, hd, t * hd, true, 0, t, t * t, batch, false, false);
-            self.dispatch(pass, "softmax", &[&s.scores], &[(batch * t) as u32, t as u32], [(batch * t).min(65535) as u32, (batch * t).div_ceil(65535) as u32, 1]);
-            self.mm(pass, &s.scores, &s.v, &s.o, None, t, hd, t, 0, t, t * t, off, hd, t * hd, false, off, hd, t * hd, batch, false, false);
+            self.dispatch(pass, "softmax", &[&s.scores, &s.inv], &[(batch * t) as u32, t as u32], [(batch * t).min(65535) as u32, (batch * t).div_ceil(65535) as u32, 1]);
+            self.mm_ex(pass, &s.scores, &s.v, &s.o, None, Some(&s.inv), t, hd, t, 0, t, t * t, off, hd, t * hd, false, off, hd, t * hd, batch, false, false);
             g0 += n;
         }
         let p = [map.g, map.t, h as u32, hd as u32, map.gs, map.ts, w as u32, excl as u32];
         self.dispatch(pass, "merge", &[&s.o, &s.v, out], &p, groups1d(g_total * t * h, 256));
     }
 
-    fn mamba_dir(&self, pass: &mut ComputePass<'_>, s: &Scratch, mw: &MambaW, x: &Buffer, out: &Buffer, map: Map, rev: bool, rows: usize) {
+    /// One direction of a BiMamba; its contribution to the block's output projection goes to `out`.
+    #[allow(clippy::too_many_arguments)]
+    fn mamba_dir(
+        &self, pass: &mut ComputePass<'_>, s: &Scratch, mw: &MambaW, x: &Buffer, out: &Buffer, bias: Option<&Buffer>, map: Map, rev: bool,
+        rows: usize,
+    ) {
         let inner = self.cfg.mamba_expand * self.cfg.width;
         let kernel = self.cfg.mamba_conv;
         let dt_rank = self.cfg.width.div_ceil(16);
@@ -502,17 +566,17 @@ impl GpuModel {
         self.mm(pass, &s.proj, &mw.dt_proj.w, &s.pre, mw.dt_proj.b.as_ref(), rows, inner, dt_rank, 0, pld, 0, 0, dt_rank, 0, true, 0, inner, 0, 1, false, false);
         let p = [map.g, map.t, inner as u32, map.gs, map.ts, rev as u32, pld as u32, dt_rank as u32];
         self.dispatch(pass, "scan", &[&s.u, &s.pre, &s.big, &s.proj, &mw.a, &mw.d, &s.y], &p, groups1d(map.g as usize * inner, 64));
-        self.linear(pass, &s.y, &mw.out_proj, out, rows, false, false);
+        let wd = self.cfg.width;
+        self.mm(pass, &s.y, &mw.out, out, bias, rows, wd, inner, 0, inner, 0, 0, inner, 0, true, 0, wd, 0, 1, bias.is_none(), false);
     }
 
     /// x [rows, W] -> mo = LayerNorm(output_proj([fwd + x, bwd + x]))
     fn bimamba(&self, pass: &mut ComputePass<'_>, s: &Scratch, bw: &BiW, map: Map, rows: usize) {
         let wd = self.cfg.width;
-        self.mamba_dir(pass, s, &bw.fwd, &s.x, &s.q, map, false, rows);
-        self.mamba_dir(pass, s, &bw.bwd, &s.x, &s.kk, map, true, rows);
-        // C = fwd @ W[:, :W]^T + bias ; C += bwd @ W[:, W:]^T ; C += x @ (W1 + W2)^T   (the "+ x" terms)
-        self.mm(pass, &s.q, &bw.out_w, &s.h, Some(&bw.out_b), rows, wd, wd, 0, wd, 0, 0, 2 * wd, 0, true, 0, wd, 0, 1, false, false);
-        self.mm(pass, &s.kk, &bw.out_w, &s.h, None, rows, wd, wd, 0, wd, 0, wd, 2 * wd, 0, true, 0, wd, 0, 1, true, false);
+        // output_proj([fwd + x, bwd + x]) = y_f @ (W1 Of)^T + bias + y_b @ (W2 Ob)^T + x @ (W1 + W2)^T,
+        // with the products of the weight matrices formed once at load time.
+        self.mamba_dir(pass, s, &bw.fwd, &s.x, &s.h, Some(&bw.out_b), map, false, rows);
+        self.mamba_dir(pass, s, &bw.bwd, &s.x, &s.h, None, map, true, rows);
         self.mm(pass, &s.x, &bw.sum_w, &s.h, None, rows, wd, wd, 0, wd, 0, 0, wd, 0, true, 0, wd, 0, 1, true, false);
         self.layernorm(pass, &s.h, &s.mo, &bw.norm, rows, wd, 0, wd, 0, wd, None);
         self.add(pass, &s.x, &s.mo, rows * wd);
@@ -626,17 +690,29 @@ impl GpuModel {
             let data = sl.get_mapped_range()?;
             let ts: &[u64] = bytemuck::cast_slice(&data);
             let period = self.queue.get_timestamp_period() as f64;
-            let mut acc: HashMap<&str, (f64, usize)> = HashMap::new();
-            for (i, name) in p.names.borrow().iter().enumerate() {
-                let e = acc.entry(name).or_insert((0.0, 0));
-                e.0 += (ts[2 * i + 1].wrapping_sub(ts[2 * i])) as f64 * period / 1e9;
+            let mut acc: HashMap<String, (f64, usize, f64)> = HashMap::new();
+            let (mut mm_t, mut mm_f) = (0.0, 0.0);
+            for (i, (name, flops)) in p.names.borrow().iter().enumerate() {
+                let dt = (ts[2 * i + 1].wrapping_sub(ts[2 * i])) as f64 * period / 1e9;
+                let e = acc.entry(name.clone()).or_insert((0.0, 0, 0.0));
+                e.0 += dt;
                 e.1 += 1;
+                e.2 += flops;
+                if *flops > 0.0 {
+                    mm_t += dt;
+                    mm_f += flops;
+                }
             }
             let mut v: Vec<_> = acc.into_iter().collect();
             v.sort_by(|a, b| b.1 .0.partial_cmp(&a.1 .0).unwrap());
-            for (n, (t, c)) in v {
-                eprintln!("  gpu {n:10} {t:7.3}s over {c} dispatches");
+            for (n, (t, c, f)) in v {
+                if f > 0.0 {
+                    eprintln!("  gpu {n:34} {t:7.3}s over {c:3} dispatches {:7.1} GFLOP {:6.0} GFLOP/s", f / 1e9, f / t / 1e9);
+                } else {
+                    eprintln!("  gpu {n:34} {t:7.3}s over {c:3} dispatches");
+                }
             }
+            eprintln!("  gpu matmul total {mm_t:.3}s, {:.0} GFLOP, {:.0} GFLOP/s", mm_f / 1e9, mm_f / mm_t / 1e9);
             drop(data);
             p.next.set(0);
             p.names.borrow_mut().clear();

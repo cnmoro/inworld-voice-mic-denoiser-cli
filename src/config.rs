@@ -120,6 +120,26 @@ pub fn read_safetensors(path: &Path) -> Result<HashMap<String, RawTensor>> {
     Ok(out)
 }
 
+/// Product of two weight matrices, so that two consecutive linear layers run as one:
+/// out[r][c] = sum_j w[r * w_ld + w_off + j] * inner[j * cols + c] for j < mid, accumulated in f64.
+pub fn compose(w: &[f32], rows: usize, w_ld: usize, w_off: usize, mid: usize, inner: &[f32], cols: usize) -> Vec<f32> {
+    use rayon::prelude::*;
+    let mut out = vec![0f32; rows * cols];
+    out.par_chunks_mut(cols).enumerate().for_each(|(r, dst)| {
+        let mut acc = vec![0f64; cols];
+        for j in 0..mid {
+            let s = w[r * w_ld + w_off + j] as f64;
+            for (a, v) in acc.iter_mut().zip(&inner[j * cols..(j + 1) * cols]) {
+                *a += s * *v as f64;
+            }
+        }
+        for (d, a) in dst.iter_mut().zip(&acc) {
+            *d = *a as f32;
+        }
+    });
+    out
+}
+
 /// What the chunked renderer needs from a backend.
 pub trait Denoiser {
     fn cfg(&self) -> &Config;
