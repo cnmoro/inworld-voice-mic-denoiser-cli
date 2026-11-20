@@ -6,11 +6,14 @@
 //! microkernel (AVX-512, AVX2+FMA or NEON, chosen at run time) computes MR x NR
 //! tiles of C. Callers parallelise over blocks of rows.
 
+#![allow(clippy::needless_range_loop)] // index loops are what the compiler vectorises here
+
 use std::cell::RefCell;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::OnceLock;
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[allow(dead_code)] // no architecture has every variant
 pub enum Isa {
     Generic,
     Avx2,
@@ -30,7 +33,18 @@ pub struct Kern {
     pub mc: usize,
     /// Rows a fused chain of layers works on at a time, so its intermediates stay in L2.
     pub blk: usize,
+    /// Products go to the system BLAS instead of the microkernel (Apple silicon, see `detect`).
+    pub blas: bool,
     micro: Micro,
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[link(name = "Accelerate", kind = "framework")]
+extern "C" {
+    fn cblas_sgemm(
+        order: i32, trans_a: i32, trans_b: i32, m: i32, n: i32, k: i32, alpha: f32, a: *const f32, lda: i32, b: *const f32, ldb: i32, beta: f32,
+        c: *mut f32, ldc: i32,
+    );
 }
 
 const MAX_TILE: usize = 12 * 32;
@@ -143,10 +157,10 @@ fn detect() -> Kern {
             && is_x86_feature_detected!("avx512dq")
             && is_x86_feature_detected!("avx512bw");
         if avx512 && force != "avx2" && force != "generic" {
-            return Kern { isa: Isa::Avx512, mr: 12, nr: 32, kc: 192, mc: 144, blk: 96, micro: micro_avx512 };
+            return Kern { isa: Isa::Avx512, mr: 12, nr: 32, kc: 192, mc: 144, blk: 96, blas: false, micro: micro_avx512 };
         }
         if avx2 && force != "generic" {
-            return Kern { isa: Isa::Avx2, mr: 6, nr: 16, kc: 256, mc: 120, blk: 48, micro: micro_avx2 };
+            return Kern { isa: Isa::Avx2, mr: 6, nr: 16, kc: 256, mc: 120, blk: 48, blas: false, micro: micro_avx2 };
         }
     }
     #[cfg(target_arch = "aarch64")]
@@ -154,10 +168,15 @@ fn detect() -> Kern {
         if force != "generic" {
             // Apple cores have 128 KB of L1 and several MB of L2 per core; other ARM cores much less.
             let (kc, mc, blk) = if cfg!(target_os = "macos") { (512, 192, 96) } else { (256, 96, 48) };
-            return Kern { isa: Isa::Neon, mr: 8, nr: 12, kc, mc, blk, micro: micro_neon };
+            // Apple silicon has a matrix coprocessor (AMX / SME) that only Accelerate's BLAS drives;
+            // on an M4 it multiplies several times faster than all NEON cores together, and
+            // letting every thread call it beats keeping some of them on NEON.
+            // INWORLD_ISA=neon keeps the products on the NEON microkernel.
+            let blas = cfg!(target_os = "macos") && force != "neon";
+            return Kern { isa: Isa::Neon, mr: 8, nr: 12, kc, mc, blk, blas, micro: micro_neon };
         }
     }
-    Kern { isa: Isa::Generic, mr: 4, nr: 8, kc: 256, mc: 96, blk: 48, micro: micro_generic }
+    Kern { isa: Isa::Generic, mr: 4, nr: 8, kc: 256, mc: 96, blk: 48, blas: false, micro: micro_generic }
 }
 
 pub fn kern() -> &'static Kern {
@@ -175,6 +194,7 @@ pub fn kern() -> &'static Kern {
     })
 }
 
+#[allow(dead_code)] // only the x86 kernels dispatch on it
 pub fn isa() -> Isa {
     kern().isa
 }
@@ -183,31 +203,45 @@ pub fn isa() -> Isa {
 pub static FLOPS: AtomicU64 = AtomicU64::new(0);
 
 /// B [k][n] packed for the microkernel: per block of K, per NR-wide strip, [kc][nr].
+/// (Kept as a plain row-major [k][n] matrix when the products go to the system BLAS.)
+#[derive(Default)]
 pub struct PackedB {
     pub k: usize,
     pub n: usize,
     blocks: Vec<(usize, usize, usize)>, // k0, kc, offset of the block's first strip
     buf: Vec<f32>,
     off: usize, // start of the 64-byte aligned data in buf
-}
-
-impl Default for PackedB {
-    fn default() -> Self {
-        Self { k: 0, n: 0, blocks: Vec::new(), buf: Vec::new(), off: 0 }
-    }
+    plain: Vec<f32>, // row-major [k][n], used instead of buf when the products go to the system BLAS
 }
 
 impl PackedB {
     /// Packs B[p][j] = src[p * ld + j], or src[j * ld + p] when `trans` (a weight stored [out][in]).
     pub fn pack(&mut self, src: &[f32], ld: usize, k: usize, n: usize, trans: bool) {
         let kn = kern();
+        self.k = k;
+        self.n = n;
+        self.blocks.clear();
+        if kn.blas {
+            if self.plain.len() < k * n {
+                self.plain = vec![0f32; k * n];
+            }
+            if trans {
+                for j in 0..n {
+                    for (p, v) in src[j * ld..j * ld + k].iter().enumerate() {
+                        self.plain[p * n + j] = *v;
+                    }
+                }
+            } else {
+                for p in 0..k {
+                    self.plain[p * n..(p + 1) * n].copy_from_slice(&src[p * ld..p * ld + n]);
+                }
+            }
+            return;
+        }
         let nr = kn.nr;
         let strips = n.div_ceil(nr);
         let nb = k.div_ceil(kn.kc).max(1);
         let (base, rem) = (k / nb, k % nb);
-        self.k = k;
-        self.n = n;
-        self.blocks.clear();
         let need = k * strips * nr;
         if self.buf.len() < need + 16 {
             self.buf = vec![0f32; need + 16];
@@ -293,6 +327,34 @@ pub fn gemm(a: &[f32], a_ld: usize, m: usize, pb: &PackedB, c: &mut [f32], c_ld:
     if crate::simd::prof::on() {
         FLOPS.fetch_add(2 * (m * n * k) as u64, Ordering::Relaxed);
     }
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    if kn.blas {
+        // SAFETY: the slices cover the m x k, k x n and m x n matrices (asserted above).
+        unsafe {
+            cblas_sgemm(
+                101, // row major
+                111, // no transpose
+                111,
+                m as i32,
+                n as i32,
+                k as i32,
+                1.0,
+                a.as_ptr(),
+                a_ld as i32,
+                pb.plain.as_ptr(),
+                n as i32,
+                if epi.accum { 1.0 } else { 0.0 },
+                c.as_mut_ptr(),
+                c_ld as i32,
+            )
+        };
+        if epi.bias.is_some() || epi.act != Act::None {
+            for i in 0..m {
+                crate::simd::epilogue(&mut c[i * c_ld..i * c_ld + n], epi.bias, epi.act);
+            }
+        }
+        return;
+    }
     let strips = n.div_ceil(nr);
     let bdata = &pb.buf[pb.off..];
     PACK.with(|pk| {
@@ -356,6 +418,7 @@ pub fn gemm(a: &[f32], a_ld: usize, m: usize, pb: &PackedB, c: &mut [f32], c_ld:
 }
 
 /// `gemm` split over rows with rayon::join, for callers that are themselves one of few parallel tasks.
+#[allow(clippy::too_many_arguments)]
 pub fn gemm_par(a: &[f32], a_ld: usize, m: usize, pb: &PackedB, c: &mut [f32], c_ld: usize, epi: Epi, min_rows: usize) {
     if m < 2 * min_rows {
         return gemm(a, a_ld, m, pb, c, c_ld, epi);

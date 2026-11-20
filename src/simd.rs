@@ -4,6 +4,8 @@
 //! is compiled for the baseline, for AVX2+FMA and for AVX-512; the widest
 //! version the CPU supports is picked at run time (on ARM, NEON is the baseline).
 
+#![allow(clippy::needless_range_loop)] // index loops are what the compiler vectorises here
+
 use crate::gemm::Act;
 
 /// Per-stage wall-clock profile, enabled with INWORLD_PROFILE.
@@ -150,6 +152,25 @@ fn exp_f<const F: bool>(x: f32) -> f32 {
     let p45 = madd::<F>(1.987_569_1e-4, r, 1.398_199_9e-3);
     let p = madd::<F>(r2 * r2, p45, madd::<F>(r2, p23, p01));
     let y = madd::<F>(p, r2, r) + 1.0;
+    // SAFETY: n is an integer in [-126, 127] after the clamp.
+    let e = unsafe { n.to_int_unchecked::<i32>() };
+    f32::from_bits(((e + 127) as u32) << 23) * y
+}
+
+/// 2^z, branch-free (relative error about 1e-7): one rounding and a degree-6 polynomial,
+/// a shorter dependency chain than exp_f for the scan, which does little else.
+#[inline(always)]
+fn exp2_f<const F: bool>(z: f32) -> f32 {
+    let z = z.max(-126.0).min(127.0);
+    let n = if F { z.round_ties_even() } else { (z + 12582912.0) - 12582912.0 };
+    let f = z - n;
+    let f2 = f * f;
+    let p01 = madd::<F>(0.693_147_2, f, 1.0);
+    let p23 = madd::<F>(0.055_503_29, f, 0.240_226_46);
+    let p45 = madd::<F>(0.001_339_989_5, f, 0.009_618_489);
+    let lo = madd::<F>(f2, p23, p01);
+    let hi = madd::<F>(f2, 0.000_153_456_97, p45);
+    let y = madd::<F>(f2 * f2, hi, lo);
     // SAFETY: n is an integer in [-126, 127] after the clamp.
     let e = unsafe { n.to_int_unchecked::<i32>() };
     f32::from_bits(((e + 127) as u32) << 23) * y
@@ -361,7 +382,8 @@ mv! {
     /// Selective scan over `rows` consecutive steps for the channels c0..c1, in place:
     /// u [rows][inner] holds the conv output on entry and the gated scan output on return.
     /// step [rows][inner] is the (softplus'd) step size, gate [rows][gate_ld] the SiLU'd gate at
-    /// column gate_off, proj [rows][pld] holds B at b_off and C at b_off + ns. a and state (h, carried
+    /// column gate_off, proj [rows][pld] holds B at b_off and C at b_off + ns. a is A * log2(e) (the
+    /// decay is 2^(step * a)); a and state (h, carried
     /// between calls) are laid out per block of SCAN_CB channels as [block][ns][SCAN_CB] (see
     /// scan_index): a block's states sit together in L1 and its rows are not 4 KB apart.
     ///
@@ -404,7 +426,7 @@ mv! {
                         let a0: [f32; L] = acc[j..j + L].try_into().unwrap();
                         let (mut h1, mut a1) = ([0f32; L], [0f32; L]);
                         for q in 0..L {
-                            let e = exp_f::<F>(s[q] * al[q]);
+                            let e = exp2_f::<F>(s[q] * al[q]);
                             let h = madd::<F>(e, h0[q], dr[q] * bk);
                             h1[q] = h;
                             a1[q] = madd::<F>(h, ck, a0[q]);
@@ -414,7 +436,7 @@ mv! {
                         j += L;
                     }
                     while j < cw {
-                        let e = exp_f::<F>(st[j] * ak[j]);
+                        let e = exp2_f::<F>(st[j] * ak[j]);
                         let h = madd::<F>(e, hk[j], drive[j] * bk);
                         hk[j] = h;
                         acc[j] = madd::<F>(h, ck, acc[j]);

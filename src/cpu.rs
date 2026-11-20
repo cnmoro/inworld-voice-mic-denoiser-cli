@@ -56,7 +56,7 @@ struct MambaW {
     conv_b: Vec<f32>,
     x_proj: Lin,
     dt_proj: Lin,
-    a: Vec<f32>, // -exp(A_log), in the scan's blocked layout
+    a: Vec<f32>, // -exp(A_log) * log2(e), in the scan's blocked layout
     d: Vec<f32>,
     out: PackedB, // output_proj half @ out_proj: inner -> W
 }
@@ -560,7 +560,7 @@ impl Model {
             let mut a = vec![0f32; simd::scan_len(ns, inner)];
             for c in 0..inner {
                 for k in 0..ns {
-                    a[simd::scan_index(ns, k, c)] = -al.data[c * ns + k].exp();
+                    a[simd::scan_index(ns, k, c)] = (-(al.data[c * ns + k] as f64).exp() * std::f64::consts::LOG2_E) as f32;
                 }
             }
             let op = get(&format!("{p}.out_proj.weight"))?; // [W][inner]
@@ -754,7 +754,7 @@ pub fn bench() {
     use std::time::Instant;
     let kn = kern();
     let threads = rayon::current_num_threads();
-    println!("kernel {:?} {}x{}, kc {} mc {} blk {}, {} threads", kn.isa, kn.mr, kn.nr, kn.kc, kn.mc, kn.blk, threads);
+    println!("kernel {:?} {}x{}{}, kc {} mc {} blk {}, {} threads", kn.isa, kn.mr, kn.nr, if kn.blas { " (matmul by Accelerate)" } else { "" }, kn.kc, kn.mc, kn.blk, threads);
     let lcg = |n: usize| -> Vec<f32> { (0..n).map(|i| ((i * 2654435761usize) % 1000) as f32 / 1000.0 - 0.5).collect() };
     for &(m, k, n) in &[(kn.blk, 512usize, 2048usize), (kn.blk, 2048, 512), (kn.blk, 512, 512), (kn.blk, 1024, 64), (kn.blk, 64, 801), (kn.blk, 801, 64)] {
         let pb = PackedB::from_weight(&lcg(n * k), k, n);

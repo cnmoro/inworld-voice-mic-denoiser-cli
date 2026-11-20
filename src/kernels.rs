@@ -31,12 +31,20 @@ pub struct MmCfg {
 }
 
 impl MmCfg {
-    pub const DEFAULT: MmCfg = MmCfg { kind: 's', tx: 16, ty: 16, rx: 4, ry: 4, ks: 16, fma: false };
     /// Kernel variants for a GPU vendor (PCI id); the dispatcher picks per matrix shape.
-    pub fn defaults(_vendor: u32) -> Vec<MmCfg> {
-        let s = |tx, ty| MmCfg { kind: 's', tx, ty, rx: 8, ry: 8, ks: 16, fma: false };
-        // 128x128 tiles for the big products, narrower ones for N = 64 and the 46x46 band attention.
-        vec![s(16, 16), s(8, 16), s(8, 8)]
+    /// Measured on an RTX 2060 SUPER, an RTX 5060 Ti and an Apple M4; INWORLD_MM overrides
+    /// ("kind,tx,ty,rx,ry,ks", several variants separated by ';').
+    pub fn defaults(vendor: u32) -> Vec<MmCfg> {
+        let cfg = |kind, tx, ty| MmCfg { kind, tx, ty, rx: 8, ry: 8, ks: 16, fma: false };
+        match vendor {
+            // Apple: vec4 loads from workgroup memory and 64 threads; larger register tiles spill.
+            0x106B => vec![cfg('v', 8, 8)],
+            // NVIDIA and AMD: 128x128 tiles for the big products, narrower ones for N = 64 and
+            // for the 46x46 band attention.
+            0x10DE | 0x1002 => vec![cfg('s', 16, 16), cfg('s', 8, 16), cfg('s', 8, 8)],
+            // Anything else (Intel, ...): the variant that did well everywhere.
+            _ => vec![cfg('s', 8, 8)],
+        }
     }
     pub fn tile_m(&self) -> u32 {
         self.ty * self.ry
