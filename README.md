@@ -66,6 +66,10 @@ Real-time factor = audio duration / processing time (higher is faster):
 | NVIDIA RTX 2060 SUPER (Linux) | `--gpu` (Vulkan) | 3.2x |
 | AMD Ryzen 9 9950X3D, 16 cores (Windows) | `--cpu` | 0.9x |
 | AMD Ryzen 7 3700X, 8 cores (Linux) | `--cpu` | 0.4x |
+| Apple M4 (macOS) | `--gpu` (Metal) | 0.55x |
+| Apple M4 (macOS) | `--cpu` | 0.2x |
+
+The macOS GPU kernels are correct but not tuned for Apple GPUs yet (they were tuned on NVIDIA); expect improvements there.
 
 These are for mono audio. Stereo is denoised channel by channel, so it takes twice as long unless you pass `--downmix`.
 
