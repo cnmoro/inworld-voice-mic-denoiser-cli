@@ -2,13 +2,14 @@
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
 mod config;
+mod cpu;
 mod dsp;
-mod fast;
+mod gemm;
 mod gpu;
 mod kernels;
 mod media;
-mod model;
 mod pipeline;
+mod simd;
 mod weights;
 
 use anyhow::{bail, Context, Result};
@@ -25,8 +26,11 @@ use std::time::Instant;
 #[command(version, about)]
 struct Args {
     /// Input files (mp3, wav, ogg, flac, m4a, mp4, mkv, mov, webm, ... anything ffmpeg reads)
-    #[arg(required = true)]
+    #[arg(required_unless_present = "bench")]
     files: Vec<PathBuf>,
+    /// Measure this machine's matrix-product rate and memory bandwidth, then exit
+    #[arg(long, hide = true)]
+    bench: bool,
     /// Run on the CPU
     #[arg(long, conflicts_with = "gpu")]
     cpu: bool,
@@ -59,7 +63,7 @@ struct Args {
 /// Loads the model on the requested backend: --cpu, --gpu, or auto (GPU if usable, else CPU).
 fn load_backend(args: &Args, weights: &Path) -> Result<(Box<dyn config::Denoiser>, String)> {
     let cpu = || -> Result<(Box<dyn config::Denoiser>, String)> {
-        Ok((Box::new(model::Model::load(weights)?), "CPU".to_string()))
+        Ok((Box::new(cpu::Model::load(weights)?), "CPU".to_string()))
     };
     if args.cpu {
         return cpu();
@@ -90,6 +94,10 @@ fn main() -> Result<()> {
     }
     if let Some(t) = args.threads {
         rayon::ThreadPoolBuilder::new().num_threads(t).build_global()?;
+    }
+    if args.bench {
+        cpu::bench();
+        return Ok(());
     }
     let ff = media::Ffmpeg::locate(args.ffmpeg.as_deref())?;
     // Fail on bad inputs before loading the model.

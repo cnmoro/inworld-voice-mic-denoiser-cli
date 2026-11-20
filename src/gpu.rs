@@ -77,7 +77,15 @@ struct Head {
     l2: Lin,
 }
 
+/// Where the kernels are recorded. Normally one compute pass holds them all; when profiling on
+/// a GPU that can only time whole passes (Metal), every dispatch gets a pass of its own.
+struct Pass<'e> {
+    enc: &'e mut wgpu::CommandEncoder,
+    cur: Option<ComputePass<'static>>,
+}
+
 struct Prof {
+    inside: bool, // timestamps can be written inside a pass
     qs: wgpu::QuerySet,
     cap: u32,
     next: std::cell::Cell<u32>,
@@ -172,7 +180,12 @@ impl GpuModel {
         let name = format!("{} ({:?})", info.name, info.backend);
         let limits = adapter.limits();
         let want_prof = std::env::var_os("INWORLD_PROFILE").is_some();
-        let prof_feats = wgpu::Features::TIMESTAMP_QUERY | wgpu::Features::TIMESTAMP_QUERY_INSIDE_PASSES;
+        let prof_inside = adapter.features().contains(wgpu::Features::TIMESTAMP_QUERY_INSIDE_PASSES);
+        let prof_feats = if prof_inside {
+            wgpu::Features::TIMESTAMP_QUERY | wgpu::Features::TIMESTAMP_QUERY_INSIDE_PASSES
+        } else {
+            wgpu::Features::TIMESTAMP_QUERY
+        };
         let want_prof = want_prof && adapter.features().contains(prof_feats);
         let (device, queue) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
             label: Some("inworldvoice"),
@@ -353,6 +366,7 @@ impl GpuModel {
         let prof = if want_prof {
             let cap = 4096u32;
             Some(Prof {
+                inside: prof_inside,
                 qs: device.create_query_set(&wgpu::QuerySetDescriptor { label: None, ty: wgpu::QueryType::Timestamp, count: cap }),
                 cap,
                 next: std::cell::Cell::new(0),
@@ -423,12 +437,12 @@ impl GpuModel {
         }
     }
 
-    fn dispatch(&self, pass: &mut ComputePass<'_>, name: &'static str, bufs: &[&Buffer], params: &[u32], groups: [u32; 3]) {
+    fn dispatch(&self, pass: &mut Pass<'_>, name: &'static str, bufs: &[&Buffer], params: &[u32], groups: [u32; 3]) {
         self.dispatch_pipe(pass, &self.pipes[name], name, bufs, params, groups)
     }
 
     fn dispatch_pipe(
-        &self, pass: &mut ComputePass<'_>, pipe: &wgpu::ComputePipeline, name: &'static str, bufs: &[&Buffer], params: &[u32], groups: [u32; 3],
+        &self, pass: &mut Pass<'_>, pipe: &wgpu::ComputePipeline, name: &'static str, bufs: &[&Buffer], params: &[u32], groups: [u32; 3],
     ) {
         let pbuf = self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: None,
@@ -443,18 +457,31 @@ impl GpuModel {
             .collect();
         entries.push(wgpu::BindGroupEntry { binding: 7, resource: pbuf.as_entire_binding() });
         let bg = self.device.create_bind_group(&wgpu::BindGroupDescriptor { label: None, layout: &layout, entries: &entries });
-        pass.set_pipeline(pipe);
-        pass.set_bind_group(0, &bg, &[]);
         let slot = self.prof.as_ref().and_then(|p| {
             let i = p.next.get();
             (i + 2 <= p.cap).then_some((p, i))
         });
-        if let Some((p, i)) = slot {
-            pass.write_timestamp(&p.qs, i);
+        let own_pass = matches!(slot, Some((p, _)) if !p.inside);
+        if own_pass || pass.cur.is_none() {
+            pass.cur = None; // end the previous pass first
+            let timestamp_writes = slot.filter(|_| own_pass).map(|(p, i)| wgpu::ComputePassTimestampWrites {
+                query_set: &p.qs,
+                beginning_of_pass_write_index: Some(i),
+                end_of_pass_write_index: Some(i + 1),
+            });
+            pass.cur = Some(pass.enc.begin_compute_pass(&wgpu::ComputePassDescriptor { label: None, timestamp_writes }).forget_lifetime());
         }
-        pass.dispatch_workgroups(groups[0], groups[1], groups[2]);
+        let cp = pass.cur.as_mut().unwrap();
+        cp.set_pipeline(pipe);
+        cp.set_bind_group(0, &bg, &[]);
+        if let Some((p, i)) = slot.filter(|_| !own_pass) {
+            cp.write_timestamp(&p.qs, i);
+        }
+        cp.dispatch_workgroups(groups[0], groups[1], groups[2]);
         if let Some((p, i)) = slot {
-            pass.write_timestamp(&p.qs, i + 1);
+            if !own_pass {
+                cp.write_timestamp(&p.qs, i + 1);
+            }
             p.next.set(i + 2);
             p.names.borrow_mut().push(p.tag.borrow_mut().take().unwrap_or((name.to_string(), 0.0)));
         }
@@ -462,7 +489,7 @@ impl GpuModel {
 
     #[allow(clippy::too_many_arguments)]
     fn mm(
-        &self, pass: &mut ComputePass<'_>, a: &Buffer, b: &Buffer, c: &Buffer, bias: Option<&Buffer>, m: usize, n: usize, kdim: usize,
+        &self, pass: &mut Pass<'_>, a: &Buffer, b: &Buffer, c: &Buffer, bias: Option<&Buffer>, m: usize, n: usize, kdim: usize,
         a_off: usize, a_ld: usize, a_bs: usize, b_off: usize, b_ld: usize, b_bs: usize, b_trans: bool, c_off: usize, c_ld: usize,
         c_bs: usize, batch: usize, accum: bool, gelu: bool,
     ) {
@@ -472,7 +499,7 @@ impl GpuModel {
     /// `mm` with an optional per-row scale (rows of every batch) instead of a bias.
     #[allow(clippy::too_many_arguments)]
     fn mm_ex(
-        &self, pass: &mut ComputePass<'_>, a: &Buffer, b: &Buffer, c: &Buffer, bias: Option<&Buffer>, row_scale: Option<&Buffer>, m: usize,
+        &self, pass: &mut Pass<'_>, a: &Buffer, b: &Buffer, c: &Buffer, bias: Option<&Buffer>, row_scale: Option<&Buffer>, m: usize,
         n: usize, kdim: usize, a_off: usize, a_ld: usize, a_bs: usize, b_off: usize, b_ld: usize, b_bs: usize, b_trans: bool, c_off: usize,
         c_ld: usize, c_bs: usize, batch: usize, accum: bool, gelu: bool,
     ) {
@@ -501,7 +528,7 @@ impl GpuModel {
     }
 
     /// out[rows, lin.out] (+)= x[rows, lin.inp] @ W^T (+ bias)
-    fn linear(&self, pass: &mut ComputePass<'_>, x: &Buffer, lin: &Lin, out: &Buffer, rows: usize, accum: bool, gelu: bool) {
+    fn linear(&self, pass: &mut Pass<'_>, x: &Buffer, lin: &Lin, out: &Buffer, rows: usize, accum: bool, gelu: bool) {
         self.mm(
             pass, x, &lin.w, out, lin.b.as_ref(), rows, lin.out, lin.inp, 0, lin.inp, 0, 0, lin.inp, 0, true, 0, lin.out, 0, 1, accum, gelu,
         );
@@ -509,7 +536,7 @@ impl GpuModel {
 
     #[allow(clippy::too_many_arguments)]
     fn layernorm(
-        &self, pass: &mut ComputePass<'_>, inp: &Buffer, out: &Buffer, ln: &Ln, rows: usize, cols: usize, in_off: usize, in_ld: usize,
+        &self, pass: &mut Pass<'_>, inp: &Buffer, out: &Buffer, ln: &Ln, rows: usize, cols: usize, in_off: usize, in_ld: usize,
         out_off: usize, out_ld: usize, pre: Option<(&Buffer, &Buffer)>,
     ) {
         let (ps, pt) = pre.unwrap_or((&self.dummy, &self.dummy));
@@ -517,14 +544,14 @@ impl GpuModel {
         self.dispatch(pass, "layernorm", &[inp, out, &ln.w, &ln.b, ps, pt], &p, [rows.min(65535) as u32, rows.div_ceil(65535) as u32, 1]);
     }
 
-    fn add(&self, pass: &mut ComputePass<'_>, a: &Buffer, b: &Buffer, n: usize) {
+    fn add(&self, pass: &mut Pass<'_>, a: &Buffer, b: &Buffer, n: usize) {
         self.dispatch(pass, "add", &[a, b], &[n as u32], groups1d(n, 256));
     }
 
-    /// Multi-head attention over the sequence axis of the token map; result rows go to \`out\`.
+    /// Multi-head attention over the sequence axis of the token map; result rows go to `out`.
     #[allow(clippy::too_many_arguments)]
     fn attention(
-        &self, pass: &mut ComputePass<'_>, s: &Scratch, qkv_in: &Buffer, out: &Buffer, map: Map, rope: bool, excl: bool,
+        &self, pass: &mut Pass<'_>, s: &Scratch, qkv_in: &Buffer, out: &Buffer, map: Map, rope: bool, excl: bool,
     ) {
         let (h, w) = (self.cfg.num_heads, self.cfg.width);
         let hd = w / h;
@@ -551,7 +578,7 @@ impl GpuModel {
     /// One direction of a BiMamba; its contribution to the block's output projection goes to `out`.
     #[allow(clippy::too_many_arguments)]
     fn mamba_dir(
-        &self, pass: &mut ComputePass<'_>, s: &Scratch, mw: &MambaW, x: &Buffer, out: &Buffer, bias: Option<&Buffer>, map: Map, rev: bool,
+        &self, pass: &mut Pass<'_>, s: &Scratch, mw: &MambaW, x: &Buffer, out: &Buffer, bias: Option<&Buffer>, map: Map, rev: bool,
         rows: usize,
     ) {
         let inner = self.cfg.mamba_expand * self.cfg.width;
@@ -571,7 +598,7 @@ impl GpuModel {
     }
 
     /// x [rows, W] -> mo = LayerNorm(output_proj([fwd + x, bwd + x]))
-    fn bimamba(&self, pass: &mut ComputePass<'_>, s: &Scratch, bw: &BiW, map: Map, rows: usize) {
+    fn bimamba(&self, pass: &mut Pass<'_>, s: &Scratch, bw: &BiW, map: Map, rows: usize) {
         let wd = self.cfg.width;
         // output_proj([fwd + x, bwd + x]) = y_f @ (W1 Of)^T + bias + y_b @ (W2 Ob)^T + x @ (W1 + W2)^T,
         // with the products of the weight matrices formed once at load time.
@@ -598,7 +625,7 @@ impl GpuModel {
 
         let mut enc = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
         {
-            let mut pass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor { label: None, timestamp_writes: None });
+            let mut pass = Pass { enc: &mut enc, cur: None };
             let pass = &mut pass;
             // Encoders: LayerNorm + Linear (+ band embedding in the bias) per band.
             for (i, ((st, _), e)) in self.edges.iter().zip(&self.encs).enumerate() {
