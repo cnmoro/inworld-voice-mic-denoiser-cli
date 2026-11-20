@@ -54,8 +54,12 @@ Real-time factor = audio duration / processing time (higher is faster):
 
 | Hardware | Backend | Speed |
 |---|---|---|
-| NVIDIA RTX 2060 SUPER | `--gpu` (Vulkan) | 3.2x |
-| AMD Ryzen 7 3700X, 8 cores | `--cpu` | 0.4x |
+| NVIDIA RTX 5060 Ti (Windows) | `--gpu` (Vulkan) | 6.0x |
+| NVIDIA RTX 2060 SUPER (Linux) | `--gpu` (Vulkan) | 3.2x |
+| AMD Ryzen 9 9950X3D, 16 cores (Windows) | `--cpu` | 0.9x |
+| AMD Ryzen 7 3700X, 8 cores (Linux) | `--cpu` | 0.4x |
+
+These are for mono audio. Stereo is denoised channel by channel, so it takes twice as long unless you pass `--downmix`.
 
 The CPU path is 20x faster than the reference PyTorch code on the same machine, but this is a 64M-parameter model
 (about 4 TFLOP per 8 s of audio), so a GPU is strongly recommended for anything long.
