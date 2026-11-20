@@ -31,11 +31,14 @@ jobs:
         run: cargo build --release
       - name: Unit tests
         run: cargo test --release
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
       - name: Golden test (CPU)
         shell: bash
         run: |
-          pip install numpy
-          python3 tests/golden.py target/release/inworldvoice --cpu
+          python -m pip install numpy
+          python tests/golden.py target/release/inworldvoice --cpu
       - name: Container smoke test
         shell: bash
         run: |
