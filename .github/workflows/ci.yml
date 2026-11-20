@@ -1,0 +1,53 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Install ffmpeg
+        shell: bash
+        run: |
+          case "$RUNNER_OS" in
+            Linux) sudo apt-get update && sudo apt-get install -y ffmpeg ;;
+            macOS) brew install ffmpeg ;;
+            Windows) choco install ffmpeg -y --no-progress ;;
+          esac
+      - name: Build
+        run: cargo build --release
+      - name: Unit tests
+        run: cargo test --release
+      - name: Golden test (CPU)
+        shell: bash
+        run: |
+          pip install numpy
+          python3 tests/golden.py target/release/inworldvoice --cpu
+      - name: Container smoke test
+        shell: bash
+        run: |
+          mkdir smoke && cd smoke
+          ffmpeg -v error -f lavfi -i testsrc=size=160x120:rate=25 -f lavfi -i "sine=frequency=440:duration=3" -t 3 -c:v libx264 -c:a aac clip.mp4
+          ffmpeg -v error -f lavfi -i "sine=frequency=440:duration=3" -c:a libmp3lame clip.mp3
+          ../target/release/inworldvoice --cpu clip.mp4 clip.mp3
+          ffprobe -v error -show_entries stream=codec_name -of csv=p=0 clip_denoised.mp4
+          ffprobe -v error -show_entries stream=codec_name -of csv=p=0 clip_denoised.mp3
+      - uses: actions/upload-artifact@v4
+        with:
+          name: inworldvoice-${{ matrix.os }}
+          path: |
+            target/release/inworldvoice
+            target/release/inworldvoice.exe

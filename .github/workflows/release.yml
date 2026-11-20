@@ -1,0 +1,54 @@
+name: Release
+
+on:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    strategy:
+      matrix:
+        include:
+          - { os: ubuntu-latest, target: x86_64-unknown-linux-gnu, name: linux-x86_64 }
+          - { os: windows-latest, target: x86_64-pc-windows-msvc, name: windows-x86_64 }
+          - { os: macos-latest, target: aarch64-apple-darwin, name: macos-arm64 }
+          - { os: macos-latest, target: x86_64-apple-darwin, name: macos-x86_64 }
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - run: cargo build --release --target ${{ matrix.target }}
+      - name: Package
+        shell: bash
+        run: |
+          mkdir dist
+          if [ "$RUNNER_OS" = "Windows" ]; then
+            cp target/${{ matrix.target }}/release/inworldvoice.exe dist/
+            cp README.md LICENSE NOTICE dist/
+            7z a inworldvoice-${{ matrix.name }}.zip ./dist/*
+          else
+            cp target/${{ matrix.target }}/release/inworldvoice dist/
+            cp README.md LICENSE NOTICE dist/
+            tar -czf inworldvoice-${{ matrix.name }}.tar.gz -C dist .
+          fi
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.name }}
+          path: inworldvoice-${{ matrix.name }}.*
+
+  publish:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          merge-multiple: true
+      - name: Create release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release create "${GITHUB_REF_NAME}" inworldvoice-* --repo "${GITHUB_REPOSITORY}" --generate-notes

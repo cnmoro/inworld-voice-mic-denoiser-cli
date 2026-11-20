@@ -1,0 +1,12 @@
+/mnt/dados3/vst/inworld-voice-mic-denoiser-cli/target-cuda/release/deps/zeroize-3f3e975632a27bd5.d: /home/moro/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/zeroize-1.9.2/src/lib.rs /home/moro/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/zeroize-1.9.2/src/x86.rs /home/moro/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/zeroize-1.9.2/src/barrier.rs /home/moro/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/zeroize-1.9.2/src/bulk.rs /home/moro/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/zeroize-1.9.2/src/stack.rs /home/moro/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/zeroize-1.9.2/src/../README.md
+
+/mnt/dados3/vst/inworld-voice-mic-denoiser-cli/target-cuda/release/deps/libzeroize-3f3e975632a27bd5.rlib: /home/moro/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/zeroize-1.9.2/src/lib.rs /home/moro/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/zeroize-1.9.2/src/x86.rs /home/moro/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/zeroize-1.9.2/src/barrier.rs /home/moro/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/zeroize-1.9.2/src/bulk.rs /home/moro/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/zeroize-1.9.2/src/stack.rs /home/moro/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/zeroize-1.9.2/src/../README.md
+
+/mnt/dados3/vst/inworld-voice-mic-denoiser-cli/target-cuda/release/deps/libzeroize-3f3e975632a27bd5.rmeta: /home/moro/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/zeroize-1.9.2/src/lib.rs /home/moro/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/zeroize-1.9.2/src/x86.rs /home/moro/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/zeroize-1.9.2/src/barrier.rs /home/moro/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/zeroize-1.9.2/src/bulk.rs /home/moro/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/zeroize-1.9.2/src/stack.rs /home/moro/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/zeroize-1.9.2/src/../README.md
+
+/home/moro/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/zeroize-1.9.2/src/lib.rs:
+/home/moro/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/zeroize-1.9.2/src/x86.rs:
+/home/moro/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/zeroize-1.9.2/src/barrier.rs:
+/home/moro/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/zeroize-1.9.2/src/bulk.rs:
+/home/moro/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/zeroize-1.9.2/src/stack.rs:
+/home/moro/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/zeroize-1.9.2/src/../README.md:

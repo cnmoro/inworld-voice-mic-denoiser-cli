@@ -1,0 +1,37 @@
+[package]
+name = "inworldvoice"
+version = "0.1.0"
+edition = "2021"
+description = "Offline voice isolation / noise reduction for any audio or video file, powered by the Inworld Voice Isolator model"
+license = "Apache-2.0"
+repository = "https://github.com/cnmoro/inworld-voice-mic-denoiser-cli"
+rust-version = "1.80"
+
+[[bin]]
+name = "inworldvoice"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1"
+candle-core = "0.9"
+candle-nn = "0.9"
+clap = { version = "4", features = ["derive"] }
+dirs = "5"
+indicatif = "0.17"
+libm = "0.2"
+mimalloc = "0.1"
+wgpu = "30"
+pollster = "1"
+bytemuck = "1"
+rayon = "1"
+rustfft = "6"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+tempfile = "3"
+ureq = "2"
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 4

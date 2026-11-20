@@ -1,0 +1,17 @@
+inworldvoice
+Copyright 2026 cnmoro
+
+This program runs the Inworld Voice Isolator (v1, offline checkpoint):
+  https://huggingface.co/inworld/voice-isolator
+  https://github.com/inworld-ai/voice-isolator
+  Copyright 2026 Inworld AI, licensed under the Apache License 2.0.
+
+src/model.rs, src/gpu.rs, src/kernels.rs and src/config.rs are independent Rust
+re-implementations of the network defined in that project's model.py, scan.py
+and isolator.py (inference only), and were checked against its published golden
+fixtures. The model weights are not included in this repository or in the
+release binaries; they are downloaded from Hugging Face on first run and
+verified by SHA-256.
+
+The golden test (tests/golden.py) downloads audio fixtures derived from
+LibriSpeech (CC BY 4.0, (c) 2014 Vassil Panayotov); they are not redistributed.
