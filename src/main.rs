@@ -151,5 +151,8 @@ fn main() -> Result<()> {
         eprintln!("{} -> {}  ({:.1}s of audio in {:.1}s, {:.2}x real time on {})",
             input.display(), dest.display(), seconds, el, seconds / el, dev_name);
     }
+    // Tearing down the wgpu device at exit intermittently crashes with 0xC0000409 on Windows
+    // (Vulkan driver threads still running). Everything is written already, so let the OS clean up.
+    std::mem::forget(model);
     Ok(())
 }
