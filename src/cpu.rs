@@ -401,7 +401,7 @@ impl Net {
                 mm(proj, pld, n, &mw.dt_proj.w, step, inner, Epi { accum: false, bias: mw.dt_proj.b.as_deref(), act: Act::Softplus });
             });
             prof::part(3, || self.scan_split(mw, n, 0, inner, Ptr(u.as_mut_ptr()), step, &xz[hist * ld..], proj, Ptr(state.as_mut_ptr()), nested));
-            let _t = std::time::Instant::now();
+            let t_out = std::time::Instant::now();
             if !rev {
                 mm(u, inner, n, &mw.out, out, w, Epi { accum: false, bias: Some(&bw.out_b), act: Act::None });
                 for i in 0..n {
@@ -422,7 +422,7 @@ impl Net {
                 }
             }
             if prof::on() {
-                prof::add(4, _t.elapsed());
+                prof::add(4, t_out.elapsed());
             }
         }
     }
