@@ -17,6 +17,14 @@ bitrate, sample rate and channel layout are kept.
 It is meant as a post-processing step. The model is bidirectional and works on 8 s windows, so it is not a
 real-time filter.
 
+## Install
+
+```
+pip install inworldvoice        # prebuilt wheels for Linux, Windows and macOS (Intel and Apple silicon)
+```
+
+This puts the `inworldvoice` command on your PATH (the wheel contains the native binary; there is no Python code).
+
 ## Requirements
 
 * **ffmpeg and ffprobe** on `PATH` (or pass `--ffmpeg <path>`). They do all decoding and muxing, so any format ffmpeg

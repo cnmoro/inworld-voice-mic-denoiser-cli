@@ -1,0 +1,28 @@
+[build-system]
+requires = ["maturin>=1.5,<2"]
+build-backend = "maturin"
+
+[project]
+name = "inworldvoice"
+description = "Remove noise from the voice in any audio or video file (Inworld Voice Isolator, standalone Rust CLI with CPU and GPU backends)"
+readme = "README.md"
+requires-python = ">=3.8"
+license = { text = "Apache-2.0" }
+license-files = ["LICENSE", "NOTICE"]
+keywords = ["audio", "noise-reduction", "denoise", "voice-isolation", "speech-enhancement", "ffmpeg", "cli"]
+classifiers = [
+    "Environment :: Console",
+    "Intended Audience :: End Users/Desktop",
+    "Programming Language :: Rust",
+    "Topic :: Multimedia :: Sound/Audio :: Speech",
+]
+dynamic = ["version"]
+
+[project.urls]
+Homepage = "https://github.com/cnmoro/inworld-voice-mic-denoiser-cli"
+Model = "https://huggingface.co/inworld/voice-isolator"
+
+[tool.maturin]
+bindings = "bin"
+strip = true
+include = [{ path = "LICENSE", format = "sdist" }, { path = "NOTICE", format = "sdist" }]
